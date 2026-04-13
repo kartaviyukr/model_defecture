@@ -1,0 +1,51 @@
+# =============================================================================
+# Конфигурация системы прогнозирования дефектуры (OOS)
+# Переменные вида ${VAR} подставляются из .env
+# =============================================================================
+
+database:
+  driver: "ODBC Driver 17 for SQL Server"
+  server: ${DB_SERVER}
+  database: ${DB_NAME}
+  username: ${DB_USER}
+  password: ${DB_PASSWORD}
+
+paths:
+  data:    "data/raw"
+  models:  "models"
+  reports: "reports"
+  logs:    "logs"
+
+model:
+  # Лучшие параметры из Optuna (ноутбук Five, PR-AUC 0.72, ROC-AUC 0.92)
+  iterations:        637
+  learning_rate:     0.0153
+  depth:             10
+  l2_leaf_reg:       1.2605
+  min_child_samples: 189
+  subsample:         0.9474
+  colsample_bylevel: 0.7989
+  scale_pos_weight:  6.7879
+  eval_metric:       "AUC"
+  early_stopping_rounds: 50
+  random_seed:       42
+  n_trials:          30        # количество трайлов Optuna
+
+  # Временной сплит (с gap-периодом для предотвращения утечки данных)
+  train_cutoff: "2025-12-10"
+  gap_end:      "2025-12-23"
+
+prediction:
+  horizon_days:       14    # горизонт прогноза OOS (дней)
+  alert_threshold:    0.70  # порог для флага is_alert
+  top_k:              200   # топ-N продуктов в отчёте
+  oos_pct_threshold:  0.10  # OOS если остаток < 10% медианы
+
+email:
+  enabled: false
+  smtp_host: ${SMTP_HOST}
+  smtp_port: 587
+  sender:    ${EMAIL_SENDER}
+  password:  ${EMAIL_PASSWORD}
+  recipients:
+    - ${EMAIL_RECIPIENT}
