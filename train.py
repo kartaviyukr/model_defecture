@@ -139,8 +139,13 @@ def train(
         threshold=pred_cfg.get("oos_pct_threshold", 0.10),
     )
 
-    # Убираем строки в конце датасета, где таргет не определён
+    # Убираем строки в конце датасета, где таргет не определён:
+    # create_target() делает shift(-horizon), поэтому последние `horizon` дней
+    # каждого продукта не имеют известного будущего → NaN в target.
+    n_before = len(df_feat)
     df_feat = df_feat.dropna(subset=["target"])
+    n_dropped = n_before - len(df_feat)
+    logger.info(f"Удалено строк с NaN target (хвост горизонта): {n_dropped:,}")
 
     pos_rate = df_feat["target"].mean()
     logger.info(
@@ -156,6 +161,9 @@ def train(
     df_train, df_test = temporal_split(df_feat, train_cutoff, gap_end)
 
     feature_cols = get_feature_columns(df_feat)
+    # Заполняем пропуски значением -999: CatBoost умеет с ним работать,
+    # а у нас пропуски возникают только на первых строках продукта,
+    # где rolling-окна ещё не накопили достаточно истории (min_periods).
     X_train = df_train[feature_cols].fillna(-999)
     y_train = df_train["target"].astype(int)
     X_test = df_test[feature_cols].fillna(-999)

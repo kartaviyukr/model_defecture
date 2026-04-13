@@ -142,11 +142,26 @@ def list_models(models_dir: str = "models") -> list:
 
 
 def get_latest_model(models_dir: str = "models") -> Optional[str]:
-    """Вернуть имя последней (лексикографически) модели."""
+    """
+    Вернуть имя последней модели по дате в имени файла (формат YYYYMMDD).
+
+    Имена моделей: catboost_oos_YYYYMMDD. Парсим дату явно —
+    YYYYMMDD сортируется лексикографически верно, но явный парсинг
+    защищает от случайных файлов с нестандартными именами.
+    """
     models = list_models(models_dir)
     if not models:
         logger.warning(f"Нет доступных моделей в '{models_dir}'")
         return None
-    latest = models[-1]
+
+    def _model_sort_key(name: str) -> datetime:
+        """Извлечь дату из имени модели; модели без даты идут в конец."""
+        try:
+            date_part = name.split("_")[-1]
+            return datetime.strptime(date_part, "%Y%m%d")
+        except (ValueError, IndexError):
+            return datetime.min
+
+    latest = max(models, key=_model_sort_key)
     logger.info(f"Последняя модель: {latest}")
     return latest

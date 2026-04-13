@@ -9,6 +9,7 @@
   db_cube — база cube        (справочник МНН/КАГ/групп)
 """
 
+import re
 from functools import lru_cache
 
 import pandas as pd
@@ -17,9 +18,29 @@ from loguru import logger
 from helpers import load_config
 from db_connector import DatabaseConnector
 
+# Паттерн для валидации дат (YYYY-MM-DD) перед подстановкой в SQL
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+
+def _validate_date(value: str, param_name: str) -> None:
+    """
+    Проверить, что строка имеет формат YYYY-MM-DD.
+    Предотвращает SQL-инъекции через параметры дат.
+    """
+    if not _DATE_RE.match(value):
+        raise ValueError(
+            f"Параметр '{param_name}' должен быть в формате YYYY-MM-DD, "
+            f"получено: {value!r}"
+        )
+
+
+@lru_cache(maxsize=1)
 def _get_connectors():
-    """Создать коннекторы к БД (лениво, при первом обращении)."""
+    """
+    Создать коннекторы к БД и закешировать их на время жизни процесса.
+    lru_cache гарантирует единственный вызов load_config() и однократное
+    создание объектов DatabaseConnector.
+    """
     config = load_config()
     db_dwh = DatabaseConnector(config)                   # dwh_price из конфига
     db_cube = DatabaseConnector(config, db_name="cube")  # cube (явно)
@@ -38,6 +59,9 @@ def load_stock_gk(start_date: str, end_date: str) -> pd.DataFrame:
         start_date: Начало периода включительно (YYYY-MM-DD)
         end_date:   Конец периода не включая (YYYY-MM-DD)
     """
+    _validate_date(start_date, "start_date")
+    _validate_date(end_date, "end_date")
+
     db_dwh, _ = _get_connectors()
     query = f"""
         SELECT *
@@ -56,6 +80,9 @@ def load_competitors(start_date: str, end_date: str) -> pd.DataFrame:
 
     # TODO: Укажите реальное имя таблицы вместо заглушки ниже.
     """
+    _validate_date(start_date, "start_date")
+    _validate_date(end_date, "end_date")
+
     db_dwh, _ = _get_connectors()
     query = f"""
         SELECT *
@@ -73,6 +100,9 @@ def load_sales(start_date: str, end_date: str) -> pd.DataFrame:
 
     # TODO: Укажите реальное имя таблицы вместо заглушки ниже.
     """
+    _validate_date(start_date, "start_date")
+    _validate_date(end_date, "end_date")
+
     db_dwh, _ = _get_connectors()
     query = f"""
         SELECT *

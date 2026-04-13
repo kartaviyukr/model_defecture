@@ -29,6 +29,7 @@ import sys
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional, Tuple
 
 import pandas as pd
 from loguru import logger
@@ -39,13 +40,9 @@ from loguru import logger
 from helpers import load_config, ensure_dirs, today_str
 from logger import setup_logger
 from data_validation import validate_stock_df, clean_stock_df
-from feature_engineering import (
-    create_all_features_clean,
-    create_predictive_features,
-)
 from model_registry import get_latest_model, load_model, list_models
-from predict import predict
-from excel_report import save_excel_report, generate_summary_report
+from predict import predict as run_predict
+from excel_report import save_excel_report
 from email_sender import send_alert_email, send_training_complete_email
 
 
@@ -81,12 +78,17 @@ def load_data_from_csv(config: dict) -> pd.DataFrame:
     return df
 
 
-def load_data_from_db(config: dict, history_days: int = 180) -> pd.DataFrame:
+def load_data_from_db(
+    config: dict, history_days: int = 180
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     """
     Загрузить актуальные данные из MSSQL через sql_loader.
 
     Загружает историю за последние `history_days` дней — этого достаточно
     для расчёта всех rolling-признаков (максимальное окно — 90 дней).
+
+    Returns:
+        Кортеж (df_stock, catalog), где catalog может быть None если таблица не настроена.
     """
     from sql_loader import load_stock_gk, load_catalog
 
@@ -100,10 +102,11 @@ def load_data_from_db(config: dict, history_days: int = 180) -> pd.DataFrame:
     try:
         catalog = load_catalog()
         logger.info(f"Справочник загружен: {len(catalog)} позиций")
-        return df_stock, catalog
     except Exception as e:
         logger.warning(f"Справочник не загружен (используем только остатки): {e}")
-        return df_stock, None
+        catalog = None
+
+    return df_stock, catalog
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +151,7 @@ def should_retrain(config: dict) -> bool:
 # Переобучение модели
 # ---------------------------------------------------------------------------
 
-def run_retrain(config: dict, config_path: str, tune: bool, dry_run: bool) -> str | None:
+def run_retrain(config: dict, config_path: str, tune: bool, dry_run: bool) -> Optional[str]:
     """Переобучить модель. Возвращает имя новой модели или None при ошибке."""
     if dry_run:
         logger.info("[DRY-RUN] Переобучение пропущено")
@@ -191,7 +194,7 @@ def run_daily_prediction(
     config: dict,
     config_path: str,
     source: str,
-    model_name: str | None,
+    model_name: Optional[str],
     dry_run: bool,
 ) -> dict:
     """
@@ -214,17 +217,13 @@ def run_daily_prediction(
 
     if source == "db":
         try:
-            data = load_data_from_db(config)
-            if isinstance(data, tuple):
-                df_raw, catalog = data
-            else:
-                df_raw = data
+            df_raw, catalog = load_data_from_db(config)
         except Exception as e:
             logger.error(f"Ошибка загрузки из БД: {e}")
             logger.info("Пробуем резервный источник — CSV...")
-            df_raw = load_data_from_csv(config)
+            df_raw, catalog = load_data_from_csv(config), None
     else:
-        df_raw = load_data_from_csv(config)
+        df_raw, catalog = load_data_from_csv(config), None
 
     # 2. Валидация
     is_valid, errors = validate_stock_df(df_raw)
@@ -236,7 +235,7 @@ def run_daily_prediction(
     # 3. Прогноз
     logger.info("Запуск прогноза...")
     try:
-        predictions = predict(
+        predictions = run_predict(
             df_stock=df_clean,
             model_name=model_name,
             config_path=config_path,
@@ -330,21 +329,21 @@ class RunLock:
 
 def _print_summary(step_results: dict, elapsed_sec: float) -> None:
     """Вывести итоговую сводку в лог."""
-    retrain = step_results.get("retrain")
-    predict = step_results.get("predict", {})
+    retrain_model = step_results.get("retrain")
+    pred_result = step_results.get("predict", {})
 
     lines = [
         "",
         "=" * 60,
         "СВОДКА ЕЖЕДНЕВНОГО ЗАПУСКА",
         "=" * 60,
-        f"  Дата:             {predict.get('date', today_str())}",
+        f"  Дата:             {pred_result.get('date', today_str())}",
         f"  Время выполнения: {elapsed_sec:.1f} сек",
-        f"  Переобучение:     {'да — ' + retrain if retrain else 'нет'}",
-        f"  Модель:           {predict.get('model_name', '—')}",
-        f"  Алертов:          {predict.get('n_alerts', '—')}",
-        f"  Excel-отчёт:      {predict.get('report_path') or '—'}",
-        f"  Статус:           {'УСПЕХ ✓' if predict.get('success') else 'ОШИБКА ✗'}",
+        f"  Переобучение:     {'да — ' + retrain_model if retrain_model else 'нет'}",
+        f"  Модель:           {pred_result.get('model_name', '—')}",
+        f"  Алертов:          {pred_result.get('n_alerts', '—')}",
+        f"  Excel-отчёт:      {pred_result.get('report_path') or '—'}",
+        f"  Статус:           {'УСПЕХ ✓' if pred_result.get('success') else 'ОШИБКА ✗'}",
         "=" * 60,
     ]
     for line in lines:

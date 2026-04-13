@@ -205,8 +205,6 @@ def _write_formatted_excel(
         if risk_scores is not None:
             data_align = Alignment(horizontal="center", vertical="center")
             for row_idx, score in enumerate(risk_scores, start=2):
-                if row_idx > len(risk_scores) + 1:
-                    break
                 level = _risk_level(float(score))
                 fill = PatternFill("solid", fgColor=COLORS[level])
                 for col_idx in range(1, len(df_report.columns) + 1):

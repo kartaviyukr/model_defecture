@@ -16,6 +16,7 @@
 import argparse
 import glob
 import os
+import traceback
 
 import pandas as pd
 from loguru import logger
@@ -98,8 +99,13 @@ def batch_predict(
                 model_name=model_name,
                 config_path=config_path,
             )
+        except FileNotFoundError as e:
+            # Нет модели — дальнейшая обработка дат бессмысленна
+            logger.error(f"Модель не найдена, прерываем пакетный прогноз: {e}")
+            raise
         except Exception as e:
             logger.error(f"Ошибка прогноза для {pred_date.date()}: {e}")
+            logger.debug(traceback.format_exc())
             continue
 
         result["batch_date"] = pred_date.date()

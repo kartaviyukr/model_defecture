@@ -11,6 +11,12 @@ Feature engineering для прогнозирования дефектуры (OO
   - Категорийный и МНН-контекст
   - Временные признаки (с циклическим кодированием)
   - Составные сигналы риска
+
+Публичный API:
+  create_target()             — бинарный таргет OOS на N дней вперёд
+  create_all_features_clean() — все признаки (вызывает приватные _add_* функции)
+  create_predictive_features() — дополнительные ранние предикторы
+  get_feature_columns()       — список признаков без служебных колонок
 """
 
 import numpy as np
@@ -20,13 +26,19 @@ from loguru import logger
 DIST_COLS = ["puls_stock", "katren_stock", "protek_stock", "farm_stock", "gk_stock"]
 DATE_COL = "date"
 CODE_COL = "code_kag"
-TARGET_HORIZON = 14       # дней для прогноза OOS
-OOS_PCT_THRESHOLD = 0.10  # OOS если остаток < 10% расширяющейся медианы
+
+# Горизонт прогноза: считаем продукт в зоне риска, если OOS наступит
+# в течение следующих 14 дней — достаточно для упреждающего заказа.
+TARGET_HORIZON = 14
+
+# Порог дефектуры: остаток < 10% исторической медианы продукта.
+# Использует расширяющуюся медиану (expanding), чтобы не заглядывать в будущее.
+OOS_PCT_THRESHOLD = 0.10
 
 
-# ---------------------------------------------------------------------------
-# Создание целевой переменной
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Целевая переменная
+# ===========================================================================
 
 def create_target(
     df: pd.DataFrame,
@@ -34,21 +46,21 @@ def create_target(
     threshold: float = OOS_PCT_THRESHOLD,
 ) -> pd.DataFrame:
     """
-    Создать бинарный таргет: станет ли продукт OOS в течение `horizon` дней?
+    Создать бинарный таргет: попадёт ли продукт в дефектуру в течение `horizon` дней?
 
-    OOS определяется как: total_stock < threshold * expanding_median(total_stock)
+    Дефектура: total_stock < threshold * expanding_median(total_stock).
+    Смотрим вперёд на `horizon` шагов: если хотя бы раз — таргет = 1.
 
     Args:
-        df:        DataFrame с колонками [date, code_kag, total_stock]
-                   (total_stock должен быть создан до вызова)
-        horizon:   Горизонт прогноза в днях (по умолчанию 14)
-        threshold: Доля от медианы ниже которой считаем OOS (по умолчанию 0.10)
+        df:        DataFrame, отсортированный по [code_kag, date].
+                   Колонка total_stock должна уже существовать.
+        horizon:   Горизонт прогноза в днях.
+        threshold: Доля от медианы, ниже которой считаем дефектуру.
 
     Returns:
-        DataFrame с новой колонкой 'target' (0/1)
+        DataFrame с новыми колонками '_is_oos' и 'target'.
     """
-    df = df.copy()
-    df = df.sort_values([CODE_COL, DATE_COL])
+    df = df.copy().sort_values([CODE_COL, DATE_COL])
 
     if "total_stock" not in df.columns:
         df["total_stock"] = df[[c for c in DIST_COLS if c in df.columns]].sum(axis=1)
@@ -60,99 +72,78 @@ def create_target(
 
     df["_is_oos"] = (df["total_stock"] < threshold * df["_product_median_exp"]).astype(int)
 
-    # Смотрим вперёд на horizon шагов: был ли OOS хотя бы раз?
+    # shift(-horizon): смотрим вперёд; rolling(horizon).max(): хотя бы один OOS
     df["target"] = (
         df.groupby(CODE_COL)["_is_oos"]
         .transform(lambda x: x.shift(-horizon).rolling(horizon, min_periods=1).max())
     ).fillna(0).astype(int)
 
-    pos_rate = df["target"].mean()
-    logger.info(f"Таргет создан: горизонт={horizon}д, OOS_порог={threshold}, "
-                f"позитивных={pos_rate:.1%}")
+    logger.info(
+        f"Таргет создан: горизонт={horizon}д, порог={threshold}, "
+        f"позитивных={df['target'].mean():.1%}"
+    )
     return df
 
 
-# ---------------------------------------------------------------------------
-# Основная функция feature engineering
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Приватные функции-помощники (вызываются только из create_all_features_clean)
+# ===========================================================================
 
-def create_all_features_clean(
-    df: pd.DataFrame,
-    catalog: pd.DataFrame = None,
-) -> pd.DataFrame:
-    """
-    Создать все 155+ признаков для модели OOS.
-
-    Args:
-        df:      DataFrame с остатками по дистрибьюторам
-                 Обязательные колонки: [date, code_kag,
-                 puls_stock, katren_stock, protek_stock, farm_stock, gk_stock]
-        catalog: Опциональный справочник с [code_kag, mnn, NM_F, NM_DT]
-
-    Returns:
-        DataFrame со всеми добавленными признаками
-    """
-    logger.info("Запуск feature engineering...")
-    df = df.copy()
-    df = df.sort_values([CODE_COL, DATE_COL]).reset_index(drop=True)
-
-    df[DATE_COL] = pd.to_datetime(df[DATE_COL])
-    available_dists = [c for c in DIST_COLS if c in df.columns]
-    for col in available_dists:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).clip(lower=0)
-
-    # ------------------------------------------------------------------
-    # 1. Базовые агрегаты
-    # ------------------------------------------------------------------
-    df["total_stock"] = df[available_dists].sum(axis=1)
+def _add_base_aggregates(df: pd.DataFrame, dists: list) -> pd.DataFrame:
+    """Базовые агрегаты: суммарный остаток, флаг полного OOS, расширяющиеся статистики."""
+    df["total_stock"] = df[dists].sum(axis=1)
     df["full_oos"] = (df["total_stock"] == 0).astype(int)
 
-    df["_product_median_exp"] = df.groupby(CODE_COL)["total_stock"].transform(
-        lambda x: x.expanding().median()
-    )
-    df["_product_max_exp"] = df.groupby(CODE_COL)["total_stock"].transform(
-        lambda x: x.expanding().max()
-    )
+    grp = df.groupby(CODE_COL)["total_stock"]
+    df["_product_median_exp"] = grp.transform(lambda x: x.expanding().median())
+    df["_product_max_exp"] = grp.transform(lambda x: x.expanding().max())
+    return df
 
-    # ------------------------------------------------------------------
-    # 2. Скорость продаж/поставок по каждому дистрибьютору
-    # ------------------------------------------------------------------
-    for dist in available_dists:
+
+def _add_velocity_features(df: pd.DataFrame, dists: list) -> pd.DataFrame:
+    """
+    Скорость продаж и поставок по каждому дистрибьютору.
+
+    sales_pct  = (prev - curr) / prev  → >0 означает снижение остатка (продажи)
+    supply_pct = (curr - prev) / prev  → >0 означает рост остатка (поставка)
+    """
+    for dist in dists:
         prev = df.groupby(CODE_COL)[dist].transform(lambda x: x.shift(1))
-        diff = prev - df[dist]  # >0: снижение = продажи, <0: рост = поставка
+        delta = prev - df[dist]
         prev_safe = prev.replace(0, np.nan)
 
-        df[f"{dist}_sales_pct"] = (diff / prev_safe).clip(-1, 10).fillna(0)
-        df[f"{dist}_supply_pct"] = ((-diff).clip(lower=0) / prev_safe).clip(0, 10).fillna(0)
-        df[f"{dist}_falling"] = (diff > 0).astype(int)
-        df[f"{dist}_rising"] = (diff < 0).astype(int)
+        df[f"{dist}_sales_pct"] = (delta / prev_safe).clip(-1, 10).fillna(0)
+        df[f"{dist}_supply_pct"] = ((-delta).clip(lower=0) / prev_safe).clip(0, 10).fillna(0)
+        df[f"{dist}_falling"] = (delta > 0).astype(int)
+        df[f"{dist}_rising"] = (delta < 0).astype(int)
 
-    sales_cols = [f"{d}_sales_pct" for d in available_dists]
-    supply_cols = [f"{d}_supply_pct" for d in available_dists]
-
+    sales_cols = [f"{d}_sales_pct" for d in dists]
+    supply_cols = [f"{d}_supply_pct" for d in dists]
     df["avg_sales_pct"] = df[sales_cols].mean(axis=1)
     df["avg_supply_pct"] = df[supply_cols].mean(axis=1)
     df["max_sales_pct"] = df[sales_cols].max(axis=1)
+    return df
 
-    # ------------------------------------------------------------------
-    # 3. Rolling-статистики (7, 14, 30 дней)
-    # ------------------------------------------------------------------
+
+def _add_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Rolling-статистики по 7, 14, 30-дневным окнам и лаговые изменения."""
     grp = df.groupby(CODE_COL)
 
     for window in [7, 14, 30]:
-        df[f"avg_sales_pct_{window}d"] = grp["avg_sales_pct"].transform(
-            lambda x, w=window: x.rolling(w, min_periods=1).mean()
+        w = window  # захват значения в замыкании
+        df[f"avg_sales_pct_{w}d"] = grp["avg_sales_pct"].transform(
+            lambda x, w=w: x.rolling(w, min_periods=1).mean()
         )
-        df[f"sales_cv_{window}d"] = grp["avg_sales_pct"].transform(
-            lambda x, w=window: (
+        df[f"sales_cv_{w}d"] = grp["avg_sales_pct"].transform(
+            lambda x, w=w: (
                 x.rolling(w, min_periods=2).std()
                 / (x.rolling(w, min_periods=2).mean().abs() + 1e-9)
             )
         ).fillna(0)
-        df[f"oos_count_{window}d"] = grp["full_oos"].transform(
-            lambda x, w=window: x.rolling(w, min_periods=1).sum()
+        df[f"oos_count_{w}d"] = grp["full_oos"].transform(
+            lambda x, w=w: x.rolling(w, min_periods=1).sum()
         )
-        df[f"had_oos_{window}d"] = (df[f"oos_count_{window}d"] > 0).astype(int)
+        df[f"had_oos_{w}d"] = (df[f"oos_count_{w}d"] > 0).astype(int)
 
     df["oos_rate_30d"] = df["oos_count_30d"] / 30.0
 
@@ -163,28 +154,37 @@ def create_all_features_clean(
             (df["total_stock"] - prev_stock) / prev_safe
         ).clip(-1, 10).fillna(0)
 
-    # Частота поставок
-    total_supply = df[supply_cols].sum(axis=1)
-    df["_had_supply"] = (total_supply > 0.01).astype(int)
+    return df
+
+
+def _add_supply_frequency(df: pd.DataFrame) -> pd.DataFrame:
+    """Частота поставок и дни с момента последней поставки."""
+    supply_cols = [c for c in df.columns if c.endswith("_supply_pct")]
+    df["_had_supply"] = (df[supply_cols].sum(axis=1) > 0.01).astype(int)
+
+    grp = df.groupby(CODE_COL)
     df["supply_freq_30d"] = grp["_had_supply"].transform(
         lambda x: x.rolling(30, min_periods=1).mean()
     )
 
-    # Дней с последней поставки (кумулятивный счётчик)
+    # Считаем дни с последней поставки через cumsum групп
     df["days_since_supply"] = grp["_had_supply"].transform(
         lambda x: x.groupby(x.cumsum()).cumcount()
     )
-    avg_supply_interval = grp["days_since_supply"].transform(
+    avg_interval = grp["days_since_supply"].transform(
         lambda x: x.rolling(90, min_periods=1).mean()
     )
     df["supply_interval_ratio"] = (
-        df["days_since_supply"] / (avg_supply_interval + 1)
+        df["days_since_supply"] / (avg_interval + 1)
     ).clip(0, 10)
     df["supply_overdue"] = (df["supply_interval_ratio"] > 1.5).astype(int)
 
-    # ------------------------------------------------------------------
-    # 4. Скорость и ускорение продаж
-    # ------------------------------------------------------------------
+    return df
+
+
+def _add_sales_dynamics(df: pd.DataFrame) -> pd.DataFrame:
+    """Скорость и ускорение продаж (соотношение темпа 7д к 14д)."""
+    grp = df.groupby(CODE_COL)
     sales_7d = grp["avg_sales_pct"].transform(lambda x: x.rolling(7, min_periods=1).mean())
     sales_14d = grp["avg_sales_pct"].transform(lambda x: x.rolling(14, min_periods=1).mean())
 
@@ -193,12 +193,13 @@ def create_all_features_clean(
     df["sales_acceleration"] = grp["sales_velocity"].transform(
         lambda x: x.diff().fillna(0)
     ).clip(-5, 5)
+    return df
 
-    # ------------------------------------------------------------------
-    # 5. Дни запаса (runway)
-    # ------------------------------------------------------------------
-    safe_sales_7d = df["avg_sales_pct_7d"].replace(0, np.nan)
-    df["days_of_stock"] = (1.0 / safe_sales_7d).clip(0, 365).fillna(365)
+
+def _add_runway_features(df: pd.DataFrame, dists: list) -> pd.DataFrame:
+    """Дни запаса (runway) на уровне всего продукта и каждого дистрибьютора."""
+    safe_sales = df["avg_sales_pct_7d"].replace(0, np.nan)
+    df["days_of_stock"] = (1.0 / safe_sales).clip(0, 365).fillna(365)
 
     df["days_of_stock_cat"] = pd.cut(
         df["days_of_stock"],
@@ -211,57 +212,55 @@ def create_all_features_clean(
     df["runway_warning"] = (df["days_of_stock"] < 14).astype(int)
     df["runway_caution"] = (df["days_of_stock"] < 30).astype(int)
 
-    for dist in available_dists:
+    for dist in dists:
         s = df[f"{dist}_sales_pct"].replace(0, np.nan)
         df[f"{dist}_runway"] = (1.0 / s).clip(0, 365).fillna(365)
 
-    runway_cols = [f"{d}_runway" for d in available_dists]
+    runway_cols = [f"{d}_runway" for d in dists]
     df["min_dist_runway"] = df[runway_cols].min(axis=1)
     df["n_dist_runway_critical"] = (df[runway_cols] < 7).sum(axis=1)
+    return df
 
-    # ------------------------------------------------------------------
-    # 6. Флаги риска по остаткам
-    # ------------------------------------------------------------------
-    df["n_zero"] = (df[available_dists] == 0).sum(axis=1)
 
-    for dist in available_dists:
-        med = df["_product_median_exp"].replace(0, np.nan)
+def _add_risk_flags(df: pd.DataFrame, dists: list) -> pd.DataFrame:
+    """Флаги риска по уровню остатков и статистические аномалии."""
+    df["n_zero"] = (df[dists] == 0).sum(axis=1)
+
+    med = df["_product_median_exp"].replace(0, np.nan)
+    for dist in dists:
         df[f"{dist}_is_low"] = (df[dist] < 0.10 * med).astype(int)
         df[f"{dist}_is_critical"] = (df[dist] < 0.05 * med).astype(int)
 
-    low_cols = [f"{d}_is_low" for d in available_dists]
-    crit_cols = [f"{d}_is_critical" for d in available_dists]
-    df["n_low"] = df[low_cols].sum(axis=1)
-    df["n_critical"] = df[crit_cols].sum(axis=1)
+    df["n_low"] = df[[f"{d}_is_low" for d in dists]].sum(axis=1)
+    df["n_critical"] = df[[f"{d}_is_critical" for d in dists]].sum(axis=1)
 
-    # Z-score аномалии остатка
-    stock_mean_30 = grp["total_stock"].transform(lambda x: x.rolling(30, min_periods=2).mean())
-    stock_std_30 = grp["total_stock"].transform(lambda x: x.rolling(30, min_periods=2).std())
+    grp = df.groupby(CODE_COL)
+
+    stock_mean = grp["total_stock"].transform(lambda x: x.rolling(30, min_periods=2).mean())
+    stock_std = grp["total_stock"].transform(lambda x: x.rolling(30, min_periods=2).std())
     df["stock_zscore"] = (
-        (df["total_stock"] - stock_mean_30) / (stock_std_30 + 1e-9)
+        (df["total_stock"] - stock_mean) / (stock_std + 1e-9)
     ).clip(-5, 5).fillna(0)
     df["stock_anomaly_low"] = (df["stock_zscore"] < -2).astype(int)
 
-    # Z-score аномалии продаж
-    sales_mean_30 = grp["avg_sales_pct"].transform(lambda x: x.rolling(30, min_periods=2).mean())
-    sales_std_30 = grp["avg_sales_pct"].transform(lambda x: x.rolling(30, min_periods=2).std())
+    sales_mean = grp["avg_sales_pct"].transform(lambda x: x.rolling(30, min_periods=2).mean())
+    sales_std = grp["avg_sales_pct"].transform(lambda x: x.rolling(30, min_periods=2).std())
     df["sales_zscore"] = (
-        (df["avg_sales_pct"] - sales_mean_30) / (sales_std_30 + 1e-9)
+        (df["avg_sales_pct"] - sales_mean) / (sales_std + 1e-9)
     ).clip(-5, 5).fillna(0)
     df["sales_spike"] = (df["sales_zscore"] > 2).astype(int)
 
-    # ------------------------------------------------------------------
-    # 7. Синхронизация дистрибьюторов
-    # ------------------------------------------------------------------
-    falling_cols = [f"{d}_falling" for d in available_dists]
-    rising_cols = [f"{d}_rising" for d in available_dists]
+    return df
 
-    df["n_dist_falling"] = df[falling_cols].sum(axis=1)
-    df["n_dist_rising"] = df[rising_cols].sum(axis=1)
-    df["all_falling"] = (df["n_dist_falling"] == len(available_dists)).astype(int)
 
-    if len(available_dists) > 1:
-        dist_vals = df[available_dists]
+def _add_distributor_sync(df: pd.DataFrame, dists: list) -> pd.DataFrame:
+    """Синхронизация дистрибьюторов: одновременное падение, концентрация (HHI), CV."""
+    df["n_dist_falling"] = df[[f"{d}_falling" for d in dists]].sum(axis=1)
+    df["n_dist_rising"] = df[[f"{d}_rising" for d in dists]].sum(axis=1)
+    df["all_falling"] = (df["n_dist_falling"] == len(dists)).astype(int)
+
+    if len(dists) > 1:
+        dist_vals = df[dists]
         dist_mean = dist_vals.mean(axis=1)
         dist_std = dist_vals.std(axis=1)
         df["stock_cv_cross"] = (dist_std / (dist_mean + 1e-9)).clip(0, 10).fillna(0)
@@ -270,26 +269,30 @@ def create_all_features_clean(
         shares = dist_vals.div(dist_sum, axis=0).fillna(0)
         df["stock_hhi"] = (shares ** 2).sum(axis=1)
 
-        for dist in available_dists:
+        for dist in dists:
             df[f"{dist}_share"] = (df[dist] / dist_sum).fillna(0)
     else:
         df["stock_cv_cross"] = 0.0
         df["stock_hhi"] = 1.0
 
-    # ------------------------------------------------------------------
-    # 8. Стресс спроса и предложения
-    # ------------------------------------------------------------------
+    return df
+
+
+def _add_supply_demand_stress(df: pd.DataFrame) -> pd.DataFrame:
+    """Стресс спроса/предложения: дефицит поставок, устойчивый отток, хроническая дефектура."""
     df["supply_sales_ratio"] = (
         df["avg_supply_pct"] / (df["avg_sales_pct"] + 1e-9)
     ).clip(0, 10)
     df["supply_deficit"] = (df["avg_supply_pct"] < 0.8 * df["avg_sales_pct"]).astype(int)
     df["net_flow"] = df["avg_supply_pct"] - df["avg_sales_pct"]
+
+    grp = df.groupby(CODE_COL)
     df["net_flow_7d"] = grp["net_flow"].transform(
         lambda x: x.rolling(7, min_periods=1).mean()
     )
     df["persistent_outflow"] = (df["net_flow_7d"] < -0.01).astype(int)
 
-    # Средняя длительность OOS-эпизода за 90 дней
+    # Средняя длительность OOS-эпизода: сумма OOS-дней / количество эпизодов за 90д
     df["avg_oos_duration"] = grp["full_oos"].transform(
         lambda x: x.rolling(90, min_periods=1).sum() / (
             x.rolling(90, min_periods=1).apply(
@@ -302,27 +305,29 @@ def create_all_features_clean(
         (df["oos_rate_30d"] > 0.10) | (df["avg_oos_duration"] > 3)
     ).astype(int)
 
-    # ------------------------------------------------------------------
-    # 9. События дистрибьюторов
-    # ------------------------------------------------------------------
-    for dist in available_dists:
+    return df
+
+
+def _add_distributor_events(df: pd.DataFrame, dists: list) -> pd.DataFrame:
+    """События дистрибьюторов: переходы в ноль, серии падений, распространение нулей."""
+    grp = df.groupby(CODE_COL)
+
+    for dist in dists:
         prev_val = grp[dist].transform(lambda x: x.shift(1))
         df[f"{dist}_went_zero_today"] = (
             (df[dist] == 0) & (prev_val > 0)
         ).astype(int)
-
-    went_zero_cols = [f"{d}_went_zero_today" for d in available_dists]
-    df["n_went_zero_today"] = df[went_zero_cols].sum(axis=1)
-
-    for dist in available_dists:
         df[f"{dist}_first_zero_rate_60d"] = grp[f"{dist}_went_zero_today"].transform(
             lambda x: x.rolling(60, min_periods=1).mean()
         )
 
-    # Серии последовательных падений / без поставок
+    df["n_went_zero_today"] = df[[f"{d}_went_zero_today" for d in dists]].sum(axis=1)
+
+    # Количество дней падения подряд у всех дистрибьюторов одновременно
     df["consecutive_falls"] = grp["all_falling"].transform(
         lambda x: x * (x.groupby((x != x.shift()).cumsum()).cumcount() + 1)
     )
+    # Количество дней без поставок подряд
     df["consecutive_no_supply"] = grp["_had_supply"].transform(
         lambda x: (1 - x) * (
             (1 - x).groupby(((1 - x) != (1 - x).shift()).cumsum()).cumcount() + 1
@@ -332,9 +337,13 @@ def create_all_features_clean(
     prev_n_zero = grp["n_zero"].transform(lambda x: x.shift(1))
     df["zeros_spreading"] = (df["n_zero"] > prev_n_zero).fillna(False).astype(int)
 
-    # ------------------------------------------------------------------
-    # 10. Категорийный / МНН контекст
-    # ------------------------------------------------------------------
+    return df
+
+
+def _add_category_context(
+    df: pd.DataFrame, catalog: pd.DataFrame = None
+) -> pd.DataFrame:
+    """Категорийный и МНН-контекст: стресс группы, доля SKU в МНН."""
     if catalog is not None:
         merge_cols = [c for c in ["code_kag", "mnn", "NM_F", "NM_DT"] if c in catalog.columns]
         if len(merge_cols) > 1:
@@ -343,6 +352,8 @@ def create_all_features_clean(
                 on="code_kag",
                 how="left",
             )
+
+    grp = df.groupby(CODE_COL)
 
     if "NM_F" in df.columns:
         df["cat_oos_rate_today"] = df.groupby([DATE_COL, "NM_F"])["full_oos"].transform("mean")
@@ -353,8 +364,8 @@ def create_all_features_clean(
         df["cat_n_oos_today"] = df.groupby([DATE_COL, "NM_F"])["full_oos"].transform("sum")
         df["cat_oos_ratio"] = df.groupby([DATE_COL, "NM_F"])["full_oos"].transform("mean")
 
-        prev_cat_oos = grp["cat_oos_rate_today"].transform(lambda x: x.shift(1))
-        df["cat_oos_growth"] = (df["cat_oos_rate_today"] - prev_cat_oos).fillna(0)
+        prev_cat = grp["cat_oos_rate_today"].transform(lambda x: x.shift(1))
+        df["cat_oos_growth"] = (df["cat_oos_rate_today"] - prev_cat).fillna(0)
         df["category_deteriorating"] = (df["cat_oos_growth"] > 0.02).astype(int)
 
     if "mnn" in df.columns:
@@ -363,9 +374,11 @@ def create_all_features_clean(
         mnn_total = df.groupby([DATE_COL, "mnn"])["total_stock"].transform("sum")
         df["sku_share_in_mnn"] = (df["total_stock"] / (mnn_total + 1e-9)).clip(0, 1)
 
-    # ------------------------------------------------------------------
-    # 11. Временные признаки
-    # ------------------------------------------------------------------
+    return df
+
+
+def _add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Временные признаки с циклическим синус/косинус кодированием."""
     df["dayofweek"] = df[DATE_COL].dt.dayofweek
     df["month"] = df[DATE_COL].dt.month
     df["day_of_month"] = df[DATE_COL].dt.day
@@ -380,22 +393,75 @@ def create_all_features_clean(
 
     df["is_month_start"] = (df["day_of_month"] <= 5).astype(int)
     df["is_month_end"] = (df["day_of_month"] >= 25).astype(int)
+    return df
 
-    # ------------------------------------------------------------------
-    # 12. Составные сигналы риска
-    # ------------------------------------------------------------------
-    risk_flags = [
+
+def _add_composite_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """Составные сигналы риска: счётчик флагов и критическая комбинация."""
+    individual_flags = [
         "runway_critical", "sales_accelerating", "supply_deficit",
         "zeros_spreading", "persistent_outflow", "stock_anomaly_low",
     ]
-    available_flags = [f for f in risk_flags if f in df.columns]
-    df["n_red_flags"] = df[available_flags].sum(axis=1)
+    present_flags = [f for f in individual_flags if f in df.columns]
+    df["n_red_flags"] = df[present_flags].sum(axis=1)
 
+    # Критическая комбинация: мало запаса + долго нет поставок + ускорение продаж
     df["critical_combination"] = (
         (df["days_of_stock"] < 14)
         & (df["days_since_supply"] > 7)
         & (df["sales_velocity"] > 1.2)
     ).astype(int)
+
+    return df
+
+
+# ===========================================================================
+# Публичный API
+# ===========================================================================
+
+def create_all_features_clean(
+    df: pd.DataFrame,
+    catalog: pd.DataFrame = None,
+) -> pd.DataFrame:
+    """
+    Создать все 155+ признаков для модели OOS.
+
+    Оркестрирует последовательный вызов приватных _add_* функций.
+    Порядок важен: каждая функция может опираться на колонки,
+    созданные предыдущими.
+
+    Args:
+        df:      DataFrame с остатками. Обязательные колонки:
+                 [date, code_kag, puls_stock, katren_stock,
+                  protek_stock, farm_stock, gk_stock]
+        catalog: Опциональный справочник [code_kag, mnn, NM_F, NM_DT]
+
+    Returns:
+        DataFrame со всеми признаками.
+    """
+    logger.info("Запуск feature engineering...")
+
+    df = df.copy().sort_values([CODE_COL, DATE_COL]).reset_index(drop=True)
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL])
+
+    # Нормализуем остатки: NaN и отрицательные → 0
+    dists = [c for c in DIST_COLS if c in df.columns]
+    for col in dists:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).clip(lower=0)
+
+    df = _add_base_aggregates(df, dists)
+    df = _add_velocity_features(df, dists)
+    df = _add_rolling_features(df)
+    df = _add_supply_frequency(df)
+    df = _add_sales_dynamics(df)
+    df = _add_runway_features(df, dists)
+    df = _add_risk_flags(df, dists)
+    df = _add_distributor_sync(df, dists)
+    df = _add_supply_demand_stress(df)
+    df = _add_distributor_events(df, dists)
+    df = _add_category_context(df, catalog)
+    df = _add_temporal_features(df)
+    df = _add_composite_signals(df)
 
     logger.info(f"Feature engineering завершён: {len(df.columns)} колонок итого")
     return df
@@ -407,18 +473,17 @@ def create_predictive_features(df: pd.DataFrame) -> pd.DataFrame:
     Вызывается после create_all_features_clean.
 
     Добавляет:
-    - Изменение дней запаса за 7/14 дней
-    - Скользящее среднее количества красных флагов
+    - Изменение дней запаса за 7/14 дней назад
+    - Скользящее среднее числа красных флагов (тренд)
     - Историческая вероятность OOS за 90 дней
     """
     df = df.copy()
     grp = df.groupby(CODE_COL)
 
     if "days_of_stock" in df.columns:
-        dos_prev_7 = grp["days_of_stock"].transform(lambda x: x.shift(7))
-        df["dos_change_7d"] = (df["days_of_stock"] - dos_prev_7).clip(-365, 365).fillna(0)
-        dos_prev_14 = grp["days_of_stock"].transform(lambda x: x.shift(14))
-        df["dos_change_14d"] = (df["days_of_stock"] - dos_prev_14).clip(-365, 365).fillna(0)
+        for lag in [7, 14]:
+            prev = grp["days_of_stock"].transform(lambda x, l=lag: x.shift(l))
+            df[f"dos_change_{lag}d"] = (df["days_of_stock"] - prev).clip(-365, 365).fillna(0)
 
     if "n_red_flags" in df.columns:
         df["red_flags_trend_7d"] = grp["n_red_flags"].transform(
@@ -434,13 +499,10 @@ def create_predictive_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------------------
-# Утилиты
-# ---------------------------------------------------------------------------
-
 def get_feature_columns(df: pd.DataFrame) -> list:
     """
-    Вернуть список признаков (исключить служебные, целевые и идентификаторы).
+    Вернуть список признаков для модели.
+    Исключает служебные, целевые и идентификационные колонки.
     """
     exclude = {
         DATE_COL, CODE_COL,

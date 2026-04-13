@@ -104,7 +104,7 @@ def send_training_complete_email(
 
 def _get_smtp_config(config: Optional[dict]) -> Optional[dict]:
     """Извлечь SMTP-параметры из конфига или переменных окружения."""
-    cfg = (config or {}).get("email", config or {})
+    cfg = (config or {}).get("email", {})
 
     host = cfg.get("smtp_host") or os.environ.get("SMTP_HOST", "")
     port = int(cfg.get("smtp_port", os.environ.get("SMTP_PORT", 587)))

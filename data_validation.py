@@ -2,7 +2,7 @@
 Валидация и очистка входных данных перед feature engineering и обучением.
 """
 
-from typing import Tuple
+from typing import List, Tuple
 
 import pandas as pd
 from loguru import logger
@@ -13,84 +13,82 @@ CODE_COL = "code_kag"
 MIN_HISTORY_DAYS = 30
 
 
-def validate_stock_df(df: pd.DataFrame) -> Tuple[bool, list]:
+def validate_stock_df(df: pd.DataFrame) -> Tuple[bool, List[str]]:
     """
     Валидация DataFrame с остатками по дистрибьюторам.
 
-    Проверяет:
-    - Наличие обязательных колонок
-    - Конвертируемость даты в datetime
-    - Отсутствие отрицательных остатков
-    - Минимальный период истории (30 дней)
-    - Непустой датасет
+    Разделяет проблемы на два уровня:
+    - Блокирующие ошибки (is_valid=False): отсутствие колонок, пустой датасет,
+      нечитаемая дата, недостаточная история — пайплайн не может продолжить.
+    - Предупреждения: отрицательные остатки, дубликаты — будут исправлены
+      в clean_stock_df(), не блокируют выполнение.
 
     Returns:
-        (is_valid, list_of_errors) — если is_valid=False, список описывает проблемы
+        (is_valid, blocking_errors) — errors содержит только блокирующие проблемы.
     """
-    errors = []
+    blocking_errors: List[str] = []
+    dates = None
 
-    # Обязательные колонки
+    # --- Пустой датасет ---
+    if len(df) == 0:
+        blocking_errors.append("DataFrame пустой")
+        logger.error("Валидация ПРОВАЛЕНА: DataFrame пустой")
+        return False, blocking_errors
+
+    # --- Обязательные колонки ---
     required_cols = [DATE_COL, CODE_COL] + DIST_COLS
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        errors.append(f"Отсутствуют обязательные колонки: {missing}")
+        blocking_errors.append(f"Отсутствуют обязательные колонки: {missing}")
 
-    # Пустой датасет
-    if len(df) == 0:
-        errors.append("DataFrame пустой")
-        return False, errors
-
-    if not errors:
-        # Тип даты
+    # --- Тип даты ---
+    if DATE_COL in df.columns:
         try:
             dates = pd.to_datetime(df[DATE_COL])
         except Exception:
-            errors.append(f"Колонка '{DATE_COL}' не конвертируется в datetime")
-            dates = None
+            blocking_errors.append(f"Колонка '{DATE_COL}' не конвертируется в datetime")
 
-        # Отрицательные остатки
-        for col in DIST_COLS:
-            if col in df.columns:
-                neg_count = (pd.to_numeric(df[col], errors="coerce") < 0).sum()
-                if neg_count > 0:
-                    errors.append(
-                        f"Отрицательные значения в '{col}': {neg_count} строк — будут заменены на 0"
-                    )
-
-        # Минимальный период истории
-        if dates is not None:
-            date_range = (dates.max() - dates.min()).days
-            if date_range < MIN_HISTORY_DAYS:
-                errors.append(
-                    f"Недостаточно истории: {date_range} дней (минимум {MIN_HISTORY_DAYS})"
-                )
-
-        # Дубликаты (date, code_kag) — не ошибка, но предупреждение
-        if DATE_COL in df.columns and CODE_COL in df.columns:
-            dupes = df.duplicated([DATE_COL, CODE_COL]).sum()
-            if dupes > 0:
-                logger.warning(
-                    f"Обнаружены дубликаты (date, code_kag): {dupes} строк — "
-                    f"будут агрегированы суммированием"
-                )
-
-    # Отрицательные остатки — только предупреждения, не блокируют валидацию
-    errors_blocking = [e for e in errors if "Отсутствуют" in e or "пустой" in e
-                       or "Недостаточно" in e or "не конвертируется" in e]
-
-    is_valid = len(errors_blocking) == 0
-    if not is_valid:
-        for e in errors_blocking:
+    # Дальнейшие проверки теряют смысл без корректных колонок и дат
+    if blocking_errors:
+        for e in blocking_errors:
             logger.error(f"Валидация ПРОВАЛЕНА: {e}")
-    else:
-        logger.info(
-            f"Валидация пройдена: {len(df):,} строк, "
-            f"{df[CODE_COL].nunique()} продуктов, "
-            f"период {pd.to_datetime(df[DATE_COL]).min().date()} — "
-            f"{pd.to_datetime(df[DATE_COL]).max().date()}"
+        return False, blocking_errors
+
+    # --- Минимальный период истории ---
+    date_range = (dates.max() - dates.min()).days
+    if date_range < MIN_HISTORY_DAYS:
+        blocking_errors.append(
+            f"Недостаточно истории: {date_range} дней (минимум {MIN_HISTORY_DAYS})"
         )
 
-    return is_valid, errors
+    if blocking_errors:
+        for e in blocking_errors:
+            logger.error(f"Валидация ПРОВАЛЕНА: {e}")
+        return False, blocking_errors
+
+    # --- Предупреждения (не блокируют, но важно знать) ---
+    for col in DIST_COLS:
+        if col in df.columns:
+            neg_count = int((pd.to_numeric(df[col], errors="coerce") < 0).sum())
+            if neg_count > 0:
+                logger.warning(
+                    f"Отрицательные значения в '{col}': {neg_count} строк — "
+                    f"будут заменены на 0 в clean_stock_df()"
+                )
+
+    dupes = df.duplicated([DATE_COL, CODE_COL]).sum()
+    if dupes > 0:
+        logger.warning(
+            f"Дубликаты (date, code_kag): {dupes} строк — "
+            f"будут агрегированы суммированием в clean_stock_df()"
+        )
+
+    logger.info(
+        f"Валидация пройдена: {len(df):,} строк, "
+        f"{df[CODE_COL].nunique()} продуктов, "
+        f"период {dates.min().date()} — {dates.max().date()}"
+    )
+    return True, []
 
 
 def clean_stock_df(df: pd.DataFrame) -> pd.DataFrame:
